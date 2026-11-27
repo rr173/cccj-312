@@ -67,6 +67,158 @@ def _get_current_turn(conn: sqlite3.Connection, game: sqlite3.Row) -> sqlite3.Ro
     ).fetchone()
 
 
+def _get_stakes(conn: sqlite3.Connection, game_id: str) -> sqlite3.Row | None:
+    """积分赛扩展信息；普通比赛返回 None。"""
+    return conn.execute(
+        "SELECT * FROM stakes_games WHERE game_id=?", (game_id,)
+    ).fetchone()
+
+
+def _validate_map(
+    width: int, height: int, blocked: list[list[int]], finish: list[list[int]]
+) -> None:
+    blocked_set = {tuple(c) for c in blocked}
+    finish_set = {tuple(c) for c in finish}
+    for label, cells in (("blocked", blocked_set), ("finish", finish_set)):
+        for x, y in cells:
+            if not (0 <= x < width and 0 <= y < height):
+                raise ServiceError(422, "cell_out_of_bounds", f"{label} 格 ({x},{y}) 越界")
+    if not finish_set:
+        raise ServiceError(422, "finish_required", "竞速游戏至少需要一个终点格")
+    if blocked_set & finish_set:
+        raise ServiceError(422, "cell_overlap", "阻挡格与终点格不可重叠")
+
+
+# ---------------------------------------------------------------------------
+# 积分账本：所有变动与业务状态转换同处一个 BEGIN IMMEDIATE 事务，
+# request_key 全局唯一作为幂等兜底，重试/重启不会重复入账。
+# ---------------------------------------------------------------------------
+def _credit_points(
+    conn: sqlite3.Connection,
+    account_id: str,
+    amount: int,
+    game_id: str | None,
+    kind: str,
+    request_key: str,
+    note: str | None,
+    now: str,
+) -> int:
+    """入账（正金额），返回入账后的可用积分。"""
+    row = conn.execute(
+        "SELECT balance FROM accounts WHERE account_id=?", (account_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, "account_not_found", f"账号 {account_id} 不存在")
+    new_balance = row["balance"] + amount
+    conn.execute(
+        "UPDATE accounts SET balance=? WHERE account_id=?", (new_balance, account_id)
+    )
+    conn.execute(
+        """INSERT INTO point_ledger(account_id, game_id, kind, amount,
+                                    balance_after, request_key, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (account_id, game_id, kind, amount, new_balance, request_key, note, now),
+    )
+    return new_balance
+
+
+def _debit_points(
+    conn: sqlite3.Connection,
+    account_id: str,
+    amount: int,
+    game_id: str | None,
+    kind: str,
+    request_key: str,
+    note: str | None,
+    now: str,
+) -> int:
+    """出账（占用），可用积分不足时整体失败、不改变任何状态。"""
+    row = conn.execute(
+        "SELECT balance FROM accounts WHERE account_id=?", (account_id,)
+    ).fetchone()
+    if row is None:
+        raise ServiceError(404, "account_not_found", f"账号 {account_id} 不存在")
+    if row["balance"] < amount:
+        raise ServiceError(
+            409,
+            "insufficient_points",
+            f"可用积分 {row['balance']} 不足以支付 {amount}，报名与积分均未改变",
+        )
+    new_balance = row["balance"] - amount
+    conn.execute(
+        "UPDATE accounts SET balance=? WHERE account_id=?", (new_balance, account_id)
+    )
+    conn.execute(
+        """INSERT INTO point_ledger(account_id, game_id, kind, amount,
+                                    balance_after, request_key, note, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (account_id, game_id, kind, -amount, new_balance, request_key, note, now),
+    )
+    return new_balance
+
+
+def _settle_stakes(
+    conn: sqlite3.Connection, game_id: str, stakes: sqlite3.Row, now: str
+) -> dict[str, Any]:
+    """积分赛全员完赛时的结算（在关回合事务内调用，整局至多执行一次）。
+
+    最早到达终点（finished_turn 最小）的同回合选手平分全部报名费；
+    除不尽的余点按账号 ID 升序依次各给一点。
+    """
+    fee = stakes["entry_fee"]
+    enrolled = conn.execute(
+        "SELECT account_id FROM enrollments WHERE game_id=? AND status='enrolled'",
+        (game_id,),
+    ).fetchall()
+    pot = fee * len(enrolled)
+
+    finished = conn.execute(
+        "SELECT player_id, finished_turn FROM players WHERE game_id=? AND finished=1",
+        (game_id,),
+    ).fetchall()
+    min_turn = min(r["finished_turn"] for r in finished)
+    winner_pids = {r["player_id"] for r in finished if r["finished_turn"] == min_turn}
+
+    roster_rows = conn.execute(
+        "SELECT player_id, account_id FROM stakes_roster WHERE game_id=?", (game_id,)
+    ).fetchall()
+    pid_to_acc = {r["player_id"]: r["account_id"] for r in roster_rows}
+    acc_to_pid = {r["account_id"]: r["player_id"] for r in roster_rows}
+    # 账号 ID 升序：余点依此顺序各给一点
+    winner_accounts = sorted(pid_to_acc[pid] for pid in winner_pids)
+
+    share, remainder = divmod(pot, len(winner_accounts))
+    payouts: list[dict[str, Any]] = []
+    for i, account_id in enumerate(winner_accounts):
+        amount = share + (1 if i < remainder else 0)
+        _credit_points(
+            conn, account_id, amount, game_id, "payout",
+            request_key=f"payout:{game_id}:{account_id}",
+            note="积分赛奖金", now=now,
+        )
+        payouts.append(
+            {"account_id": account_id, "player_id": acc_to_pid[account_id], "amount": amount}
+        )
+
+    conn.execute(
+        "UPDATE enrollments SET status='settled', closed_at=? "
+        "WHERE game_id=? AND status='enrolled'",
+        (now, game_id),
+    )
+    settlement = {
+        "pot": pot,
+        "entry_fee": fee,
+        "winners": winner_accounts,
+        "payouts": payouts,
+    }
+    conn.execute(
+        "UPDATE stakes_games SET status='finished', settlement_json=?, updated_at=? "
+        "WHERE game_id=?",
+        (json.dumps(settlement), now, game_id),
+    )
+    return settlement
+
+
 def _latest_revisions(
     conn: sqlite3.Connection, game_id: str, turn_no: int
 ) -> dict[str, sqlite3.Row]:
@@ -105,16 +257,7 @@ def create_game(req: Any) -> dict[str, Any]:
     # 参数一致性校验
     if len(set(req.players)) != len(req.players):
         raise ServiceError(422, "duplicate_player_name", "玩家名不可重复")
-    blocked = {tuple(c) for c in req.blocked}
-    finish = {tuple(c) for c in req.finish}
-    for label, cells in (("blocked", blocked), ("finish", finish)):
-        for x, y in cells:
-            if not (0 <= x < req.width and 0 <= y < req.height):
-                raise ServiceError(422, "cell_out_of_bounds", f"{label} 格 ({x},{y}) 越界")
-    if not finish:
-        raise ServiceError(422, "finish_required", "竞速游戏至少需要一个终点格")
-    if blocked & finish:
-        raise ServiceError(422, "cell_overlap", "阻挡格与终点格不可重叠")
+    _validate_map(req.width, req.height, req.blocked, req.finish)
 
     def tx(conn: sqlite3.Connection) -> dict[str, Any]:
         pepper = get_pepper(conn)
@@ -176,21 +319,29 @@ def list_games() -> list[dict[str, Any]]:
     conn = get_conn()
     try:
         rows = conn.execute("SELECT * FROM games ORDER BY created_at").fetchall()
+        return [
+            {
+                "game_id": r["game_id"],
+                "name": r["name"],
+                # 已取消的积分赛对外呈现 cancelled
+                "status": _effective_status(conn, r),
+                "current_turn_no": r["current_turn_no"],
+                "width": r["width"],
+                "height": r["height"],
+                "blocked": _loads(r["blocked_json"]),
+                "finish": _loads(r["finish_json"]),
+            }
+            for r in rows
+        ]
     finally:
         conn.close()
-    return [
-        {
-            "game_id": r["game_id"],
-            "name": r["name"],
-            "status": r["status"],
-            "current_turn_no": r["current_turn_no"],
-            "width": r["width"],
-            "height": r["height"],
-            "blocked": _loads(r["blocked_json"]),
-            "finish": _loads(r["finish_json"]),
-        }
-        for r in rows
-    ]
+
+
+def _effective_status(conn: sqlite3.Connection, game: sqlite3.Row) -> str:
+    stakes = _get_stakes(conn, game["game_id"])
+    if stakes is not None and stakes["status"] == "cancelled":
+        return "cancelled"
+    return game["status"]
 
 
 def start_game(game_id: str) -> dict[str, Any]:
@@ -198,6 +349,23 @@ def start_game(game_id: str) -> dict[str, Any]:
         game = _get_game(conn, game_id)
         if game["status"] != "setup":
             raise ServiceError(409, "game_not_in_setup", "仅 setup 状态的游戏可以开局")
+        stakes = _get_stakes(conn, game_id)
+        if stakes is not None:
+            if stakes["status"] == "cancelled":
+                raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不能发车")
+            counts = conn.execute(
+                "SELECT (SELECT COUNT(*) FROM stakes_roster WHERE game_id=?) AS roster, "
+                "(SELECT COUNT(*) FROM enrollments WHERE game_id=? AND status='enrolled') "
+                "AS enrolled",
+                (game_id, game_id),
+            ).fetchone()
+            if counts["enrolled"] < counts["roster"]:
+                raise ServiceError(
+                    409,
+                    "roster_not_fully_enrolled",
+                    f"名单 {counts['roster']} 人中仅 {counts['enrolled']} 人报名，"
+                    "名单上的选手全部报名后才可发车",
+                )
         players = conn.execute(
             "SELECT * FROM players WHERE game_id=? ORDER BY rowid", (game_id,)
         ).fetchall()
@@ -237,6 +405,11 @@ def start_game(game_id: str) -> dict[str, Any]:
             "UPDATE games SET status='active', current_turn_no=1, updated_at=? WHERE game_id=?",
             (now, game_id),
         )
+        if stakes is not None:
+            conn.execute(
+                "UPDATE stakes_games SET status='active', updated_at=? WHERE game_id=?",
+                (now, game_id),
+            )
         return {"game_id": game_id, "status": "active", "current_turn_no": 1, "deadline": deadline}
 
     return run_transaction(tx)
@@ -288,6 +461,10 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
 
     def tx(conn: sqlite3.Connection) -> dict[str, Any]:
         game = _get_game(conn, game_id)
+        stakes = _get_stakes(conn, game_id)
+        if stakes is not None and stakes["status"] == "cancelled":
+            # 取消与最终裁定并发时，写锁保证只有一个终局生效
+            raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不再裁定新结果")
         if game["status"] != "active":
             if game["status"] == "finished":
                 raise ServiceError(409, "game_finished", "游戏已结束，没有可关闭的回合")
@@ -388,6 +565,11 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
         all_finished = all(bool(p["finished"]) or p["player_id"] in newly_finished for p in players)
         new_status = "finished" if all_finished else "active"
 
+        # 积分赛：全员完赛才结算；此前即使已有选手到达终点也不发奖
+        settlement = None
+        if all_finished and stakes is not None:
+            settlement = _settle_stakes(conn, game_id, stakes, now)
+
         announcement = {
             "game_id": game_id,
             "turn_no": turn_no,
@@ -398,6 +580,8 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
             "winners": winners,
             "game_status": new_status,
         }
+        if settlement is not None:
+            announcement["stakes"] = settlement
 
         conn.execute(
             """UPDATE turns SET status='closed', closed_at=?, announcement_json=?
@@ -437,8 +621,21 @@ def takeover(game_id: str, player_id: str, secret: str) -> dict[str, Any]:
         pepper = get_pepper(conn)
         game = _get_game(conn, game_id)
         player = _get_player(conn, game_id, player_id)
+        stakes = _get_stakes(conn, game_id)
+        if stakes is not None and stakes["status"] == "cancelled":
+            raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不能再接手")
         if not verify_secret(pepper, secret, player["secret_hash"]):
             raise ServiceError(401, "bad_secret", "接手密钥错误")
+        if stakes is not None:
+            # 积分赛席位：仅已报名（或已随完赛结算）的账号可凭本人账号密钥接手
+            enr = conn.execute(
+                "SELECT status FROM enrollments WHERE game_id=? AND account_id=?",
+                (game_id, player["account_id"]),
+            ).fetchone()
+            if enr is None or enr["status"] not in ("enrolled", "settled"):
+                raise ServiceError(
+                    409, "not_enrolled", "该席位对应的账号未报名本场比赛，不能接手"
+                )
 
         old_generation = player["device_generation"]
         new_generation = old_generation + 1
@@ -556,6 +753,9 @@ def submit_command(game_id: str, token: str, direction: str) -> dict[str, Any]:
         game = _get_game(conn, game_id)
         player = _get_player(conn, game_id, device["player_id"])
 
+        stakes = _get_stakes(conn, game_id)
+        if stakes is not None and stakes["status"] == "cancelled":
+            raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不能提交指令")
         if game["status"] != "active":
             raise ServiceError(409, "game_not_active", "游戏未在进行中，不能提交指令")
         turn = _get_current_turn(conn, game)
@@ -642,10 +842,27 @@ def get_public_state(game_id: str) -> dict[str, Any]:
             "ORDER BY finished_turn, player_id",
             (game_id,),
         ).fetchall()
+        stakes_summary = None
+        stakes = _get_stakes(conn, game_id)
+        if stakes is not None:
+            enrolled = conn.execute(
+                "SELECT COUNT(*) AS c FROM enrollments WHERE game_id=? AND status='enrolled'",
+                (game_id,),
+            ).fetchone()["c"]
+            roster_size = conn.execute(
+                "SELECT COUNT(*) AS c FROM stakes_roster WHERE game_id=?", (game_id,)
+            ).fetchone()["c"]
+            stakes_summary = {
+                "status": stakes["status"],
+                "entry_fee": stakes["entry_fee"],
+                "enrolled": enrolled,
+                "roster_size": roster_size,
+                "pot": stakes["entry_fee"] * enrolled,
+            }
         return {
             "game_id": game_id,
             "name": game["name"],
-            "status": game["status"],
+            "status": _effective_status(conn, game),
             "width": game["width"],
             "height": game["height"],
             "blocked": _loads(game["blocked_json"]),
@@ -665,6 +882,7 @@ def get_public_state(game_id: str) -> dict[str, Any]:
             "board": board,
             "players": [_player_public(p) for p in players],
             "winners": [r["player_id"] for r in winners_rows],
+            "stakes": stakes_summary,
         }
     finally:
         conn.close()

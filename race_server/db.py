@@ -53,6 +53,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         finished          INTEGER NOT NULL DEFAULT 0,
         finished_turn     INTEGER,
         device_generation INTEGER NOT NULL DEFAULT 0,
+        account_id        TEXT,          -- 积分赛席位对应的账号；普通比赛为 NULL
         created_at        TEXT NOT NULL,
         UNIQUE (game_id, name)
     )
@@ -94,9 +95,80 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UNIQUE (game_id, turn_no, player_id, sequence)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS accounts (
+        account_id  TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        secret_hash TEXT NOT NULL,
+        balance     INTEGER NOT NULL DEFAULT 0 CHECK (balance >= 0),
+        created_at  TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS stakes_games (
+        game_id         TEXT PRIMARY KEY REFERENCES games(game_id),
+        entry_fee       INTEGER NOT NULL CHECK (entry_fee > 0),
+        status          TEXT NOT NULL DEFAULT 'enrolling'
+            CHECK (status IN ('enrolling', 'active', 'finished', 'cancelled')),
+        settlement_json TEXT,
+        cancelled_at    TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS stakes_roster (
+        game_id    TEXT NOT NULL REFERENCES games(game_id),
+        account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        player_id  TEXT NOT NULL REFERENCES players(player_id),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (game_id, account_id),
+        UNIQUE (game_id, player_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS enrollments (
+        game_id     TEXT NOT NULL REFERENCES games(game_id),
+        account_id  TEXT NOT NULL REFERENCES accounts(account_id),
+        epoch       INTEGER NOT NULL,
+        status      TEXT NOT NULL
+            CHECK (status IN ('enrolled', 'withdrawn', 'refunded', 'settled')),
+        enrolled_at TEXT NOT NULL,
+        closed_at   TEXT,
+        PRIMARY KEY (game_id, account_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS stakes_requests (
+        game_id     TEXT NOT NULL,
+        account_id  TEXT NOT NULL,
+        request_id  TEXT NOT NULL,
+        action      TEXT NOT NULL CHECK (action IN ('enroll', 'withdraw')),
+        epoch       INTEGER NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (game_id, account_id, request_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS point_ledger (
+        entry_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        game_id       TEXT,
+        kind          TEXT NOT NULL
+            CHECK (kind IN ('initial', 'hold', 'release', 'refund', 'payout')),
+        amount        INTEGER NOT NULL,
+        balance_after INTEGER NOT NULL,
+        request_key   TEXT NOT NULL UNIQUE,
+        note          TEXT,
+        created_at    TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_devices_player ON devices(player_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_turn ON command_revisions(game_id, turn_no)",
     "CREATE INDEX IF NOT EXISTS idx_turns_game ON turns(game_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ledger_account ON point_ledger(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_enrollments_game ON enrollments(game_id)",
 )
 
 
@@ -125,6 +197,10 @@ def init_schema() -> None:
         try:
             for stmt in SCHEMA_STATEMENTS:
                 conn.execute(stmt)
+            # 既有数据库的轻量迁移：players 补 account_id 列（老数据为 NULL）
+            player_cols = {row[1] for row in conn.execute("PRAGMA table_info(players)")}
+            if "account_id" not in player_cols:
+                conn.execute("ALTER TABLE players ADD COLUMN account_id TEXT")
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES ('pepper', ?)",
                 (secrets.token_hex(32),),
