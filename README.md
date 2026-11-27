@@ -58,6 +58,34 @@ Python 3.11 + FastAPI + SQLite（WAL 模式）实现的回合制网格竞速游�
 - **资金安全**：所有积分变动与状态转换同处一个写事务，跨场同时报名不会超支；
   流水 `request_key` 全局唯一兜底，请求重试或服务重启不会多发奖或多退款。
 
+## 2.2 八人双败杯
+
+在既有竞速玩法之上叠加可申诉重赛的淘汰赛。**不报名、不扣积分、不发积分奖**，
+账号只用于身份识别与接手席位。
+
+- **签表**：裁定员提供 8 个不同的现有账号、首轮签位顺序（即 ``seeds`` 数组顺序，
+  签位 1..8）以及所有场次共用的地图与回合时长。首轮按相邻签位配对
+  ``(1,2)(3,4)(5,6)(7,8)``，创建时即公布完整签表；**重赛不重新抽签**。
+- **开赛**：每个签表场次对应一局普通比赛，沿用既有回合玩法。只有在两名选手的
+  晋级资格都已确定后才能开赛，场次至多一局有效。开赛时创建两名席位选手，
+  其接手密钥即账号密钥，选手凭本人账号接手对应席位，之后的提交/关回合/公告完全一致。
+- **胜负**：两人都完赛才产生场次胜负——先到终点者胜，同回合到达时**原始签位靠前者**胜
+  （原始签位号小者优先）。选手初始在胜者组，首败转入败者组，第二败淘汰。
+- **总决赛**：两组各剩一人时开赛；胜者组选手赢下即夺冠，败者组选手赢下则两人
+  再赛一局（加赛）定冠军。
+- **重赛与失效**：裁定员可对**已完赛**的对局裁定重赛，即使冠军已产生。该局胜负失效，
+  直接或间接依赖它取得参赛资格的后续对局（无论进行中还是已完赛）一并失效；
+  不依赖它的对局原样保留。若冠军因此失去依据，撤��冠军。失效对局保留已公开公告，
+  但不再接受接手/提交指令/裁定；待签位重新具有有效资格时须**开新对局**，
+  不能沿用旧对局的结果或设备。
+- **幂等与迟到请求**：开赛/重赛按 ``request_id`` 幂等（持久化，重启后重放仍返回首次结果）。
+  开赛可带 ``expected_revision``；签表版本每次开赛/重赛自增，迟到请求即使换了
+  ``request_id`` 也会因版本过期或该场次已有有效对局而被拒，无法操作新对局。
+- **一致性**：所有开赛/重赛/关回合都在 ``BEGIN IMMEDIATE`` 事务中完成，单写者串行化
+  保证同一场次不会出现两局同时有效，也不会凭失效资格继续比赛；服务重启后签表与
+  对局由有效对局重新推导，保持一致。
+- **计分**：不报名、不扣分、不发积分奖；账号余额与流水不受杯赛影响。
+
 ## 3. 启动
 
 ```bash
@@ -84,6 +112,10 @@ uvicorn race_server.main:app --host 0.0.0.0 --port 8000
 | POST | `/referee/accounts` | 创建选手账号 `{"name": "...", "initial_points": 100}`，返回账号密钥（仅一次） |
 | GET  | `/referee/accounts` | 列出账号及可用积分 |
 | POST | `/referee/stakes-games` | 创建积分赛：地图参数同普通比赛，另加 `{"roster": ["账号名"...], "entry_fee": 正整数}` |
+| POST | `/referee/cups` | 创建八人双败杯：地图参数 + `{"seeds": ["账号名"×8]}`，返回完整首轮签表 |
+| GET  | `/referee/cups` | 列出杯赛 |
+| POST | `/referee/cups/{cup_id}/matches/{match_no}/start` | 开赛某场次：`{"request_id": "...", "expected_revision": n}`（后两项可选版本保护） |
+| POST | `/referee/cups/{cup_id}/games/{game_id}/rematch` | 裁定某已完赛对局重赛：`{"request_id": "..."}` |
 
 ### 选手账号（请求头 `X-Account-Secret`）
 
@@ -108,6 +140,12 @@ uvicorn race_server.main:app --host 0.0.0.0 --port 8000
 | GET | `/games/{game_id}` | 地形、玩家与**已公告**棋盘、当前回合元数据；积分赛附带 stakes 概要 |
 | GET | `/games/{game_id}/announcements/{turn_no}` | 指定回合的公告；积分赛最终回合公告附分账结果 |
 | GET | `/games/{game_id}/stakes` | 积分赛名单、报名进度、终局与分账结果 |
+| GET | `/cups/{cup_id}` | 杯赛完整签表：全部场次（含可开赛标记）、签位、冠军、失效记录、请求历史 |
+| GET | `/cups/{cup_id}/startable` | 当前可开赛的场次编号 |
+| GET | `/cups/{cup_id}/games` | 杯赛关联的全部对局（含已失效的） |
+| GET | `/cups/{cup_id}/champion` | 当前冠军（含是否曾被撤回） |
+| GET | `/cups/{cup_id}/invalidations` | 失效记录（失效对局、原因、连带失效、冠军撤回） |
+| GET | `/cups/games/{game_id}` | 对局所属杯赛场次（关联对局）；非杯赛对局返回 `404 not_cup_game` |
 | GET | `/health` | 健康检查 |
 
 错误响应统一为 `{"error": "...", "detail": "..."}`。
@@ -132,7 +170,6 @@ curl -s -X POST localhost:8000/referee/games/$GID/close \
 ```
 
 ## 6. 积分赛典型流程
-
 ```bash
 TOK=change-me
 # 裁定员创建账号（初始积分 100），密钥仅本次返回
@@ -167,7 +204,35 @@ curl -s localhost:8000/accounts/me -H "X-Account-Secret: $ASEC"
 curl -s localhost:8000/games/$GID/stakes
 ```
 
-## 7. 测试
+## 7. 八人双败杯典型流程
+
+```bash
+TOK=change-me
+# 裁定员先创建八个账号（省略重复），密钥只在创建时返回
+# 创建杯赛：种子顺序即首轮签位 1..8，首轮相邻配对
+CUP=$(curl -s -X POST localhost:8000/referee/cups -H "X-Referee-Token: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"width":6,"height":2,"finish":[[5,0],[5,1]],
+       "seeds":["p1","p2","p3","p4","p5","p6","p7","p8"]}')
+CID=$(python3 -c "import json,sys;print(json.load(sys.stdin)['cup_id'])" <<<"$CUP")
+
+# 查看完整签表：首轮四场可开赛
+curl -s localhost:8000/cups/$CID
+
+# 开赛场次 1（两侧资格已确定）；返回对局 game_id，之后用普通比赛接口打
+GAME=$(curl -s -X POST localhost:8000/referee/cups/$CID/matches/1/start \
+  -H "X-Referee-Token: $TOK" -H 'Content-Type: application/json' \
+  -d '{"request_id":"start-m1"}' | python3 -c "import json,sys;print(json.load(sys.stdin)['game_id'])")
+curl -s localhost:8000/games/$GAME          # 两名席位选手即签位 1、2 的账号
+# 选手凭本人账号密钥接手自己的席位，提交指令，裁定员关回合……（同普通比赛）
+
+# 已完赛后若需重赛：该局及依赖它的后续对局一并失效，冠军可能被撤回
+curl -s -X POST localhost:8000/referee/cups/$CID/games/$GAME/rematch \
+  -H "X-Referee-Token: $TOK" -H 'Content-Type: application/json' -d '{"request_id":"rm-1"}'
+# 之后重新开赛场次（必须是新对局）：curl .../cups/$CID/matches/1/start
+```
+
+## 8. 测试
 
 ```bash
 python3 -m pytest tests/ -q
@@ -178,4 +243,8 @@ python3 -m pytest tests/ -q
 - `tests/test_concurrency.py`：真实 uvicorn 服务器上的并发接手/提交/关回合；
 - `tests/test_stakes.py`：积分赛账号、报名/撤回幂等、发车条件、接手、结算与取消；
 - `tests/test_stakes_concurrency.py`：跨场并发报名不超支、同标识并发报名、
-  取消与最终裁定并发只产生一个终局。
+  取消与最终裁定并发只产生一个终局；
+- `tests/test_cup.py`：杯赛签表公布、开赛资格、接手、先后到达/同回合签位裁定、
+  双败晋级、总决赛与加赛、重赛失效传播与冠军撤回、幂等/迟到请求、重启持久性；
+- `tests/test_cup_concurrency.py`：并发开赛只产生一局有效、并发重赛只生效一次、
+  最后一回合裁定与重赛并发不产生两局同时有效。

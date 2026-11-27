@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header
 
-from . import config, services, stakes
+from . import config, cups, services, stakes
 from .models import (
     AccountCreated,
     AccountMe,
@@ -14,9 +14,17 @@ from .models import (
     CommandAcceptedResponse,
     CommandRequest,
     CreateAccountRequest,
+    CreateCupRequest,
     CreateGameRequest,
     CreateGameResponse,
     CreateStakesGameRequest,
+    CupCreated,
+    CupGameLink,
+    CupRematchRequest,
+    CupRematchResult,
+    CupStartResult,
+    CupState,
+    CupSummary,
     EnrollmentResult,
     GameSummary,
     MyPlayerState,
@@ -25,15 +33,18 @@ from .models import (
     StakeActionRequest,
     StakesGameCreated,
     StakesState,
+    StartCupMatchRequest,
     TakeoverResponse,
 )
 from .services import ServiceError
 
 referee_router = APIRouter(prefix="/referee/games", tags=["referee"])
 referee_meta_router = APIRouter(prefix="/referee", tags=["referee"])
+referee_cup_router = APIRouter(prefix="/referee/cups", tags=["referee"])
 account_router = APIRouter(tags=["account"])
 device_router = APIRouter(tags=["device"])
 public_router = APIRouter(tags=["public"])
+cup_public_router = APIRouter(prefix="/cups", tags=["cup"])
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +164,97 @@ def stakes_state(game_id: str) -> dict:
 )
 def announcement(game_id: str, turn_no: int) -> dict:
     return services.get_announcement(game_id, turn_no)
+
+
+# ---------------------------------------------------------------------------
+# 裁定员：八人双败杯
+# ---------------------------------------------------------------------------
+@referee_meta_router.post(
+    "/cups", response_model=CupCreated, status_code=201,
+    dependencies=[Depends(require_referee)],
+)
+def create_cup(body: CreateCupRequest) -> dict:
+    return cups.create_cup(body)
+
+
+@referee_meta_router.get(
+    "/cups", response_model=list[CupSummary], dependencies=[Depends(require_referee)]
+)
+def cups_list() -> list[dict]:
+    return cups.list_cups()
+
+
+@referee_cup_router.post(
+    "/{cup_id}/matches/{match_no}/start", response_model=CupStartResult,
+    dependencies=[Depends(require_referee)],
+)
+def start_cup_match(cup_id: str, match_no: int, body: StartCupMatchRequest) -> dict:
+    return cups.start_match(cup_id, match_no, body.request_id, body.expected_revision)
+
+
+@referee_cup_router.post(
+    "/{cup_id}/games/{game_id}/rematch", response_model=CupRematchResult,
+    dependencies=[Depends(require_referee)],
+)
+def cup_rematch(cup_id: str, game_id: str, body: CupRematchRequest) -> dict:
+    return cups.rematch(cup_id, game_id, body.request_id)
+
+
+# ---------------------------------------------------------------------------
+# 杯赛公开查询
+# ---------------------------------------------------------------------------
+@cup_public_router.get("/{cup_id}", response_model=CupState)
+def cup_state(cup_id: str) -> dict:
+    return cups.get_cup_state(cup_id)
+
+
+@cup_public_router.get("/{cup_id}/startable", response_model=list[int])
+def cup_startable(cup_id: str) -> list[int]:
+    return cups.get_cup_state(cup_id)["startable_matches"]
+
+
+@cup_public_router.get("/{cup_id}/champion")
+def cup_champion(cup_id: str) -> dict:
+    state = cups.get_cup_state(cup_id)
+    return {
+        "cup_id": cup_id,
+        "champion_seed_no": state["champion_seed_no"],
+        "champion_account_id": state["champion_account_id"],
+        "champion_name": state["champion_name"],
+        "champion_withdrawn": state["champion_withdrawn"],
+    }
+
+
+@cup_public_router.get("/{cup_id}/invalidations")
+def cup_invalidations(cup_id: str) -> list[dict]:
+    return cups.get_cup_state(cup_id)["invalidations"]
+
+
+@cup_public_router.get("/{cup_id}/games", response_model=list[CupGameLink])
+def cup_games(cup_id: str) -> list[dict]:
+    """杯赛关联的全部对局（含已因重赛失效的）。"""
+    return cups.list_cup_games(cup_id)
+
+
+# 对局 -> 所属杯赛场次（关联对局查询）；非杯赛对局返回 404 not_cup_game
+@cup_public_router.get("/games/{game_id}", response_model=CupGameLink)
+def game_cup_link(game_id: str) -> dict:
+    body = cups.get_game_cup(game_id)
+    return {
+        "game_id": game_id,
+        "cup_id": body["cup_id"],
+        "match_no": body["match_no"],
+        "order_index": body["order_index"],
+        "slot": body["slot"],
+        "status": "completed" if body["winner_account_id"] else "in_progress",
+        "valid": body["valid"],
+        "home_seed_no": body["home_seed_no"],
+        "away_seed_no": body["away_seed_no"],
+        "winner_account_id": body["winner_account_id"],
+        "announcement_turns": body["announcement_turns"],
+        "invalidated_reason": body["invalidated_reason"],
+        "invalidated_at": body["invalidated_at"],
+    }
 
 
 # ---------------------------------------------------------------------------

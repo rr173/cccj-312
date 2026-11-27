@@ -11,7 +11,15 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .db import init_schema
-from .routers import account_router, device_router, public_router, referee_meta_router, referee_router
+from .routers import (
+    account_router,
+    cup_public_router,
+    device_router,
+    public_router,
+    referee_cup_router,
+    referee_meta_router,
+    referee_router,
+)
 from .services import ServiceError
 
 
@@ -38,7 +46,9 @@ def health() -> dict[str, str]:
 
 
 app.include_router(public_router)
+app.include_router(cup_public_router)
 app.include_router(account_router)
 app.include_router(device_router)
 app.include_router(referee_router)
 app.include_router(referee_meta_router)
+app.include_router(referee_cup_router)

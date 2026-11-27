@@ -164,11 +164,87 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         created_at    TEXT NOT NULL
     )
     """,
+    # ------------------------------------------------------------------
+    # 八人双败杯
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS cups (
+        cup_id                TEXT PRIMARY KEY,
+        name                  TEXT NOT NULL,
+        width                 INTEGER NOT NULL,
+        height                INTEGER NOT NULL,
+        blocked_json          TEXT NOT NULL DEFAULT '[]',
+        finish_json           TEXT NOT NULL DEFAULT '[]',
+        turn_duration_seconds INTEGER NOT NULL DEFAULT 60,
+        -- 签表版本：每次开赛/重赛自增，用于拒绝迟到的旧请求
+        revision              INTEGER NOT NULL DEFAULT 0,
+        champion_withdrawn    INTEGER NOT NULL DEFAULT 0,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cup_seeds (
+        cup_id     TEXT NOT NULL REFERENCES cups(cup_id),
+        seed_no    INTEGER NOT NULL,       -- 原始签位 1..8，越大越靠后
+        account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        name       TEXT NOT NULL,
+        PRIMARY KEY (cup_id, seed_no),
+        UNIQUE (cup_id, account_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cup_games (
+        game_id            TEXT PRIMARY KEY REFERENCES games(game_id),
+        cup_id             TEXT NOT NULL REFERENCES cups(cup_id),
+        match_no           INTEGER NOT NULL,
+        order_index        INTEGER NOT NULL,   -- 该场次的第几局（1 起）
+        slot               TEXT NOT NULL CHECK (slot IN ('regular', 'decider')),
+        home_seed          INTEGER,
+        away_seed          INTEGER,
+        winner_player_id   TEXT,
+        loser_player_id    TEXT,
+        valid              INTEGER NOT NULL DEFAULT 1,
+        invalidated_reason TEXT,
+        invalidated_at     TEXT,
+        created_at         TEXT NOT NULL,
+        UNIQUE (cup_id, match_no, order_index)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cup_invalidations (
+        invalidation_id       TEXT PRIMARY KEY,
+        cup_id                TEXT NOT NULL REFERENCES cups(cup_id),
+        rematch_request_id    TEXT NOT NULL,
+        invalidated_game_id   TEXT NOT NULL,
+        match_no              INTEGER NOT NULL,
+        scope_slot            TEXT NOT NULL,
+        reason                TEXT NOT NULL,
+        turn_no               INTEGER,
+        propagated_json       TEXT NOT NULL DEFAULT '[]',
+        champion_withdrawn    INTEGER NOT NULL DEFAULT 0,
+        created_at            TEXT NOT NULL,
+        UNIQUE (cup_id, rematch_request_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cup_requests (
+        cup_id      TEXT NOT NULL REFERENCES cups(cup_id),
+        kind        TEXT NOT NULL CHECK (kind IN ('start', 'rematch')),
+        request_id  TEXT NOT NULL,
+        match_no    INTEGER NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (cup_id, kind, request_id)
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_devices_player ON devices(player_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_turn ON command_revisions(game_id, turn_no)",
     "CREATE INDEX IF NOT EXISTS idx_turns_game ON turns(game_id)",
     "CREATE INDEX IF NOT EXISTS idx_ledger_account ON point_ledger(account_id)",
     "CREATE INDEX IF NOT EXISTS idx_enrollments_game ON enrollments(game_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cup_games_cup ON cup_games(cup_id, match_no)",
+    "CREATE INDEX IF NOT EXISTS idx_cup_invalidations_cup ON cup_invalidations(cup_id)",
 )
 
 

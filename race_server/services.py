@@ -74,6 +74,13 @@ def _get_stakes(conn: sqlite3.Connection, game_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _get_cup_game(conn: sqlite3.Connection, game_id: str) -> sqlite3.Row | None:
+    """杯赛对局扩展信息；非杯赛对局返回 None。"""
+    return conn.execute(
+        "SELECT * FROM cup_games WHERE game_id=?", (game_id,)
+    ).fetchone()
+
+
 def _validate_map(
     width: int, height: int, blocked: list[list[int]], finish: list[list[int]]
 ) -> None:
@@ -462,9 +469,15 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
     def tx(conn: sqlite3.Connection) -> dict[str, Any]:
         game = _get_game(conn, game_id)
         stakes = _get_stakes(conn, game_id)
+        cup_game = _get_cup_game(conn, game_id)
         if stakes is not None and stakes["status"] == "cancelled":
             # 取消与最终裁定并发时，写锁保证只有一个终局生效
             raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不再裁定新结果")
+        if cup_game is not None and not cup_game["valid"]:
+            # 失效对局保留已公开公告，但不再接受裁定
+            raise ServiceError(
+                409, "cup_game_invalidated", "该对局已因重赛失效，不能继续裁定"
+            )
         if game["status"] != "active":
             if game["status"] == "finished":
                 raise ServiceError(409, "game_finished", "游戏已结束，没有可关闭的回合")
@@ -594,6 +607,35 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
                 "UPDATE games SET status='finished', updated_at=? WHERE game_id=?",
                 (now, game_id),
             )
+            if cup_game is not None:
+                # 杯赛对局：先到终点者胜；同回合到达时原始签位靠前者胜
+                finishers = conn.execute(
+                    "SELECT player_id, finished_turn FROM players "
+                    "WHERE game_id=? AND finished=1",
+                    (game_id,),
+                ).fetchall()
+                seed_of = {
+                    row["player_id"]: row["seed_no"]
+                    for row in conn.execute(
+                        """SELECT p.player_id, s.seed_no
+                           FROM players p
+                           JOIN cup_seeds s
+                             ON s.cup_id = ? AND s.account_id = p.account_id
+                           WHERE p.game_id=?""",
+                        (cup_game["cup_id"], game_id),
+                    ).fetchall()
+                }
+                ranked = sorted(
+                    finishers,
+                    key=lambda r: (r["finished_turn"], seed_of.get(r["player_id"], 999)),
+                )
+                winner = ranked[0]["player_id"]
+                loser = ranked[1]["player_id"] if len(ranked) > 1 else None
+                conn.execute(
+                    "UPDATE cup_games SET winner_player_id=?, loser_player_id=? "
+                    "WHERE game_id=?",
+                    (winner, loser, game_id),
+                )
         else:
             next_deadline = _iso(now_dt + timedelta(seconds=game["turn_duration_seconds"]))
             # 新回合公开可玩：同一事务内写入，未提交前任何设备都无法看到/提交
@@ -622,8 +664,13 @@ def takeover(game_id: str, player_id: str, secret: str) -> dict[str, Any]:
         game = _get_game(conn, game_id)
         player = _get_player(conn, game_id, player_id)
         stakes = _get_stakes(conn, game_id)
+        cup_game = _get_cup_game(conn, game_id)
         if stakes is not None and stakes["status"] == "cancelled":
             raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不能再接手")
+        if cup_game is not None and not cup_game["valid"]:
+            raise ServiceError(
+                409, "cup_game_invalidated", "该对局已因重赛失效，不能再接手"
+            )
         if not verify_secret(pepper, secret, player["secret_hash"]):
             raise ServiceError(401, "bad_secret", "接手密钥错误")
         if stakes is not None:
@@ -756,6 +803,11 @@ def submit_command(game_id: str, token: str, direction: str) -> dict[str, Any]:
         stakes = _get_stakes(conn, game_id)
         if stakes is not None and stakes["status"] == "cancelled":
             raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不能提交指令")
+        cup_game = _get_cup_game(conn, game_id)
+        if cup_game is not None and not cup_game["valid"]:
+            raise ServiceError(
+                409, "cup_game_invalidated", "该对局已因重赛失效，不能提交指令"
+            )
         if game["status"] != "active":
             raise ServiceError(409, "game_not_active", "游戏未在进行中，不能提交指令")
         turn = _get_current_turn(conn, game)

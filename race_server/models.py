@@ -68,6 +68,33 @@ class StakeActionRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 八人双败杯：请求
+# ---------------------------------------------------------------------------
+class CreateCupRequest(BaseModel):
+    name: str = Field(default="cup", max_length=80)
+    width: int = Field(default=10, ge=1, le=64)
+    height: int = Field(default=10, ge=1, le=64)
+    blocked: list[list[int]] = Field(default_factory=list)
+    # 所有场次共用的终点格
+    finish: list[list[int]] = Field(default_factory=list)
+    turn_duration_seconds: int = Field(default=60, ge=1, le=86400)
+    # 八个不同账号的账号名，顺序即首轮签位 1..8
+    seeds: list[str] = Field(min_length=8, max_length=8)
+
+
+class StartCupMatchRequest(BaseModel):
+    # 请求标识：开赛按此标识幂等重试；旧请求重放只会返回原对局
+    request_id: str = Field(min_length=1, max_length=128)
+    # 可选的签表版本保护：与当前 revision 不一致时拒绝，避免迟到请求误开新对局
+    expected_revision: int | None = None
+
+
+class CupRematchRequest(BaseModel):
+    # 请求标识：重赛按此标识幂等重试
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+# ---------------------------------------------------------------------------
 # 响应
 # ---------------------------------------------------------------------------
 class PlayerCredential(BaseModel):
@@ -350,3 +377,153 @@ class StakesState(BaseModel):
     # 终局分账结果；未结算/已取消为 None
     settlement: StakesSettlement | None
     cancelled_at: str | None
+
+
+
+
+# ---------------------------------------------------------------------------
+# 八人双败杯：响应
+# ---------------------------------------------------------------------------
+class CupSeed(BaseModel):
+    seed_no: int
+    account_id: str
+    name: str
+
+
+class CupCreated(BaseModel):
+    cup_id: str
+    status: str
+    revision: int
+    width: int
+    height: int
+    blocked: list[list[int]]
+    finish: list[list[int]]
+    turn_duration_seconds: int
+    seeds: list[CupSeed]
+    # 开赛前公布的首轮签表（完整签表可由 GET /cups/{cup_id} 查看）
+    first_round: list["CupMatchView"]
+
+
+class CupSummary(BaseModel):
+    cup_id: str
+    name: str
+    status: str
+    revision: int
+    champion_account_id: str | None = None
+
+
+class CupGameLink(BaseModel):
+    game_id: str
+    cup_id: str
+    match_no: int
+    order_index: int
+    slot: str  # regular | decider
+    status: str  # in_progress | completed
+    valid: bool
+    home_seed_no: int | None = None
+    away_seed_no: int | None = None
+    winner_account_id: str | None = None
+    # 失效对局保留已公开的公告，但不再可接手/提交/裁定
+    announcement_turns: int = 0
+    # 失效原因（valid=false 时给出）
+    invalidated_reason: str | None = None
+    invalidated_at: str | None = None
+
+
+class CupSlotView(BaseModel):
+    # 该侧资格的来源签位集合（通常 1 人；总决赛为 2 人）
+    candidate_seeds: list[int]
+    # 当前已确定的签位；None 表示尚未确定
+    seed_no: int | None = None
+    account_id: str | None = None
+    name: str | None = None
+
+
+class CupMatchView(BaseModel):
+    match_no: int
+    bracket: str  # winners | losers | final | decider
+    round_no: int
+    label: str
+    # 晋级资格是否已确定（两侧都确定才能开赛）
+    eligible: bool
+    # 是否可开赛（有确定资格、尚无有效对局）
+    startable: bool
+    # 当前有效对局（进行中或已完赛）；None 表示尚无有效对局
+    active_game_id: str | None = None
+    # 决定该场次结果的已完赛有效对局
+    current_game_id: str | None = None
+    status: str  # pending | awaiting_players | in_progress | finished
+    home: CupSlotView
+    away: CupSlotView
+    winner_seed_no: int | None = None
+    loser_seed_no: int | None = None
+    # 该场次关联的全部对局（含已失效的）
+    games: list[CupGameLink] = Field(default_factory=list)
+
+
+class CupInvalidation(BaseModel):
+    invalidation_id: str
+    rematch_request_id: str
+    invalidated_game_id: str
+    match_no: int
+    scope_slot: str
+    reason: str
+    turn_no: int | None
+    invalidated_at: str
+    # 因该局失效而被连带失效的后续对局
+    propagated_game_ids: list[str] = Field(default_factory=list)
+    champion_withdrawn: bool = False
+
+
+class CupStartResult(BaseModel):
+    cup_id: str
+    match_no: int
+    game_id: str
+    revision: int
+    request_id: str
+    idempotent_replay: bool
+    # 重放旧请求时该对局可能已因重赛失效；不改变历史结果，但明确提示
+    game_valid: bool
+
+
+class CupRematchResult(BaseModel):
+    cup_id: str
+    invalidated_game_id: str
+    match_no: int
+    revision: int
+    request_id: str
+    idempotent_replay: bool
+    invalidated_games: list[str]
+    champion_withdrawn: bool
+
+
+class CupStanding(BaseModel):
+    seed_no: int
+    account_id: str
+    name: str
+    status: str  # winner | loser | champion | runner_up | eliminated
+
+
+class CupState(BaseModel):
+    cup_id: str
+    name: str
+    status: str  # setup | active | finished
+    revision: int
+    width: int
+    height: int
+    blocked: list[list[int]]
+    finish: list[list[int]]
+    turn_duration_seconds: int
+    seeds: list[CupSeed]
+    matches: list[CupMatchView]
+    standings: list[CupStanding]
+    # 当前可开赛的场次编号
+    startable_matches: list[int]
+    champion_seed_no: int | None = None
+    champion_account_id: str | None = None
+    champion_name: str | None = None
+    # 冠军是否曾被撤回（撤回后若重赛再度产生冠军，会重新给出）
+    champion_withdrawn: bool = False
+    invalidations: list[CupInvalidation]
+    # 请求历史（按 request_id 幂等）
+    request_log: list[dict]
