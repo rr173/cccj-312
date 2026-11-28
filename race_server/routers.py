@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header
 
-from . import config, cups, services, stakes
+from . import config, cups, practice, services, stakes
 from .models import (
     AccountCreated,
     AccountMe,
@@ -17,6 +17,7 @@ from .models import (
     CreateCupRequest,
     CreateGameRequest,
     CreateGameResponse,
+    CreatePracticeRoomRequest,
     CreateStakesGameRequest,
     CupCreated,
     CupGameLink,
@@ -28,6 +29,18 @@ from .models import (
     EnrollmentResult,
     GameSummary,
     MyPlayerState,
+    PracticeActionRequest,
+    PracticeConfirmResult,
+    PracticeDeclineResult,
+    PracticeEndResult,
+    PracticeGameView,
+    PracticeInvitationView,
+    PracticeMeView,
+    PracticeMyRegistration,
+    PracticePairResult,
+    PracticeRegistrationResult,
+    PracticeRoomSummary,
+    PracticeRoomView,
     PublicGameState,
     RefereeTurnDetail,
     StakeActionRequest,
@@ -41,10 +54,13 @@ from .services import ServiceError
 referee_router = APIRouter(prefix="/referee/games", tags=["referee"])
 referee_meta_router = APIRouter(prefix="/referee", tags=["referee"])
 referee_cup_router = APIRouter(prefix="/referee/cups", tags=["referee"])
+referee_practice_router = APIRouter(prefix="/referee/practice-rooms", tags=["referee"])
 account_router = APIRouter(tags=["account"])
 device_router = APIRouter(tags=["device"])
 public_router = APIRouter(tags=["public"])
 cup_public_router = APIRouter(prefix="/cups", tags=["cup"])
+practice_router = APIRouter(tags=["practice"])
+practice_public_router = APIRouter(prefix="/practice-rooms", tags=["practice"])
 
 
 # ---------------------------------------------------------------------------
@@ -289,3 +305,144 @@ def submit_command(
 @public_router.get("/games/{game_id}", response_model=PublicGameState)
 def public_state(game_id: str) -> dict:
     return services.get_public_state(game_id)
+
+
+# ---------------------------------------------------------------------------
+# 裁定员：练习赛大厅（练习房与提前结束）
+# ---------------------------------------------------------------------------
+@referee_practice_router.post(
+    "", response_model=PracticeRoomView, status_code=201,
+    dependencies=[Depends(require_referee)],
+)
+def create_practice_room(body: CreatePracticeRoomRequest) -> dict:
+    return practice.create_room(body)
+
+
+@referee_practice_router.get(
+    "", response_model=list[PracticeRoomSummary],
+    dependencies=[Depends(require_referee)],
+)
+def referee_practice_rooms() -> list[dict]:
+    return practice.list_rooms()
+
+
+@referee_practice_router.post(
+    "/{room_id}/pair", response_model=PracticePairResult,
+    dependencies=[Depends(require_referee)],
+)
+def referee_request_pair(room_id: str, body: PracticeActionRequest) -> dict:
+    """裁定员请求某房间配对一次：取当前可配对的最早两位。"""
+    return practice.request_pair(room_id, body.request_id)
+
+
+@referee_meta_router.post(
+    "/practice-games/{game_id}/end", response_model=PracticeEndResult,
+    dependencies=[Depends(require_referee)],
+)
+def end_practice_game(game_id: str) -> dict:
+    """提前结束练习赛：不算完赛，保留已公开公告，不再接手/提交/裁定。"""
+    return practice.end_practice_game(game_id)
+
+
+# ---------------------------------------------------------------------------
+# 选手账号：练习赛大厅（请求头 X-Account-Secret）
+# ---------------------------------------------------------------------------
+@practice_router.post(
+    "/practice-rooms/{room_id}/register", response_model=PracticeRegistrationResult
+)
+def practice_register(
+    room_id: str, body: PracticeActionRequest, x_account_secret: str = Header(...)
+) -> dict:
+    return practice.register(room_id, x_account_secret, body.request_id)
+
+
+@practice_router.post(
+    "/practice-rooms/{room_id}/withdraw", response_model=PracticeRegistrationResult
+)
+def practice_withdraw(
+    room_id: str, body: PracticeActionRequest, x_account_secret: str = Header(...)
+) -> dict:
+    return practice.withdraw(room_id, x_account_secret, body.request_id)
+
+
+@practice_router.post(
+    "/practice-rooms/{room_id}/pair", response_model=PracticePairResult
+)
+def practice_request_pair(
+    room_id: str, body: PracticeActionRequest, x_account_secret: str = Header(...)
+) -> dict:
+    """选手请求某房间配对一次（与裁定员接口同一幂等空间）。"""
+    return practice.request_pair(room_id, body.request_id)
+
+
+@practice_router.post(
+    "/practice-invitations/{invitation_id}/confirm",
+    response_model=PracticeConfirmResult,
+)
+def practice_confirm(
+    invitation_id: str, x_account_secret: str = Header(...)
+) -> dict:
+    return practice.confirm_invitation(invitation_id, x_account_secret)
+
+
+@practice_router.post(
+    "/practice-invitations/{invitation_id}/decline",
+    response_model=PracticeDeclineResult,
+)
+def practice_decline(
+    invitation_id: str, x_account_secret: str = Header(...)
+) -> dict:
+    return practice.decline_invitation(invitation_id, x_account_secret)
+
+
+@practice_router.get(
+    "/practice-invitations/{invitation_id}", response_model=PracticeInvitationView
+)
+def practice_invitation(
+    invitation_id: str, x_account_secret: str = Header(...)
+) -> dict:
+    return practice.get_invitation_view(invitation_id, x_account_secret)
+
+
+@practice_router.get("/practice/me", response_model=PracticeMeView)
+def practice_me(x_account_secret: str = Header(...)) -> dict:
+    """本人的大厅总览：各房排队状态、待回复邀请与已配成对局。"""
+    return practice.get_my_lobby(x_account_secret)
+
+
+@practice_router.get(
+    "/practice/me/registrations", response_model=list[PracticeMyRegistration]
+)
+def practice_me_registrations(x_account_secret: str = Header(...)) -> list[dict]:
+    return practice.get_my_registrations(x_account_secret)
+
+
+@practice_router.get(
+    "/practice/me/invitations", response_model=list[PracticeInvitationView]
+)
+def practice_me_invitations(x_account_secret: str = Header(...)) -> list[dict]:
+    return practice.get_my_invitations(x_account_secret)
+
+
+@practice_router.get("/practice/me/games", response_model=list[PracticeGameView])
+def practice_me_games(x_account_secret: str = Header(...)) -> list[dict]:
+    return practice.get_my_games(x_account_secret)
+
+
+# ---------------------------------------------------------------------------
+# 公开：练习房与练习对局查询
+# ---------------------------------------------------------------------------
+@practice_public_router.get("", response_model=list[PracticeRoomSummary])
+def public_practice_rooms() -> list[dict]:
+    return practice.list_rooms()
+
+
+@practice_public_router.get("/{room_id}", response_model=PracticeRoomView)
+def public_practice_room(room_id: str) -> dict:
+    return practice.get_room_detail(room_id)
+
+
+@public_router.get("/practice-games/{game_id}", response_model=PracticeGameView)
+def public_practice_game(game_id: str) -> dict:
+    """对局所属练习房与配对邀请；非练习赛对局返回 404 practice_not_found。"""
+    return practice.get_practice_game_view(game_id)

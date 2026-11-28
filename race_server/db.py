@@ -238,6 +238,102 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (cup_id, kind, request_id)
     )
     """,
+    # ------------------------------------------------------------------
+    # 练习赛大厅
+    # ------------------------------------------------------------------
+    """
+    CREATE TABLE IF NOT EXISTS practice_rooms (
+        room_id                 TEXT PRIMARY KEY,
+        name                    TEXT NOT NULL,
+        width                   INTEGER NOT NULL,
+        height                  INTEGER NOT NULL,
+        blocked_json            TEXT NOT NULL DEFAULT '[]',
+        finish_json             TEXT NOT NULL DEFAULT '[]',
+        turn_duration_seconds   INTEGER NOT NULL DEFAULT 60,
+        -- 配对确认时限：邀请发出后双方须在此秒数内确认
+        confirm_timeout_seconds INTEGER NOT NULL,
+        created_at              TEXT NOT NULL,
+        updated_at              TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_registrations (
+        room_id    TEXT NOT NULL REFERENCES practice_rooms(room_id),
+        account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        -- 每次重新报名自增；旧请求按 (room_id, account_id, request_id) 幂等隔离
+        epoch      INTEGER NOT NULL,
+        -- 入队顺序号（房间级单调递增）；暂停/恢复不改变，重新报名取新号
+        seq        INTEGER NOT NULL,
+        status     TEXT NOT NULL
+            CHECK (status IN ('queued', 'paused', 'invited',
+                              'consumed', 'withdrawn', 'removed')),
+        request_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (room_id, account_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_requests (
+        room_id     TEXT NOT NULL,
+        account_id  TEXT NOT NULL,
+        request_id  TEXT NOT NULL,
+        action      TEXT NOT NULL CHECK (action IN ('register', 'withdraw')),
+        epoch       INTEGER NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (room_id, account_id, request_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_invitations (
+        invitation_id TEXT PRIMARY KEY,
+        room_id       TEXT NOT NULL REFERENCES practice_rooms(room_id),
+        status        TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'started', 'declined', 'expired')),
+        -- 确认截止（服务端时间）；过期邀请由后续操作懒处理，不能复活
+        deadline      TEXT NOT NULL,
+        game_id       TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_invitation_seats (
+        invitation_id TEXT NOT NULL REFERENCES practice_invitations(invitation_id),
+        account_id    TEXT NOT NULL REFERENCES accounts(account_id),
+        -- 邀请对应的报名 epoch：过期/解除时只影响该次报名，不碰后来的新报名
+        reg_epoch     INTEGER NOT NULL,
+        response      TEXT NOT NULL DEFAULT 'pending'
+            CHECK (response IN ('pending', 'confirmed', 'declined')),
+        responded_at  TEXT,
+        player_id     TEXT,
+        PRIMARY KEY (invitation_id, account_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_pair_requests (
+        room_id     TEXT NOT NULL,
+        request_id  TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (room_id, request_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS practice_games (
+        game_id         TEXT PRIMARY KEY REFERENCES games(game_id),
+        room_id         TEXT NOT NULL REFERENCES practice_rooms(room_id),
+        invitation_id   TEXT NOT NULL REFERENCES practice_invitations(invitation_id),
+        home_account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        away_account_id TEXT NOT NULL REFERENCES accounts(account_id),
+        status          TEXT NOT NULL DEFAULT 'active'
+            CHECK (status IN ('active', 'finished', 'ended')),
+        ended_at        TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_devices_player ON devices(player_id)",
     "CREATE INDEX IF NOT EXISTS idx_revisions_turn ON command_revisions(game_id, turn_no)",
     "CREATE INDEX IF NOT EXISTS idx_turns_game ON turns(game_id)",
@@ -245,6 +341,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_enrollments_game ON enrollments(game_id)",
     "CREATE INDEX IF NOT EXISTS idx_cup_games_cup ON cup_games(cup_id, match_no)",
     "CREATE INDEX IF NOT EXISTS idx_cup_invalidations_cup ON cup_invalidations(cup_id)",
+    "CREATE INDEX IF NOT EXISTS idx_practice_reg_account ON practice_registrations(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_practice_inv_room ON practice_invitations(room_id)",
+    "CREATE INDEX IF NOT EXISTS idx_practice_seats_account "
+    "ON practice_invitation_seats(account_id)",
+    "CREATE INDEX IF NOT EXISTS idx_practice_games_room ON practice_games(room_id)",
 )
 
 

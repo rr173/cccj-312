@@ -15,9 +15,12 @@ from .routers import (
     account_router,
     cup_public_router,
     device_router,
+    practice_public_router,
+    practice_router,
     public_router,
     referee_cup_router,
     referee_meta_router,
+    referee_practice_router,
     referee_router,
 )
 from .services import ServiceError
@@ -47,8 +50,11 @@ def health() -> dict[str, str]:
 
 app.include_router(public_router)
 app.include_router(cup_public_router)
+app.include_router(practice_public_router)
 app.include_router(account_router)
+app.include_router(practice_router)
 app.include_router(device_router)
 app.include_router(referee_router)
 app.include_router(referee_meta_router)
 app.include_router(referee_cup_router)
+app.include_router(referee_practice_router)

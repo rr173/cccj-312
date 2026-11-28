@@ -95,6 +95,25 @@ class CupRematchRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 练习赛大厅：请求
+# ---------------------------------------------------------------------------
+class CreatePracticeRoomRequest(BaseModel):
+    name: str = Field(default="practice-room", max_length=80)
+    width: int = Field(default=10, ge=1, le=64)
+    height: int = Field(default=10, ge=1, le=64)
+    blocked: list[list[int]] = Field(default_factory=list)
+    finish: list[list[int]] = Field(default_factory=list)
+    turn_duration_seconds: int = Field(default=60, ge=1, le=86400)
+    # 配对确认时限：邀请发出后双方须在此秒数内确认，否则邀请过期
+    confirm_timeout_seconds: int = Field(default=60, ge=1, le=86400)
+
+
+class PracticeActionRequest(BaseModel):
+    # 请求标识：报名/撤销/配对按此标识幂等重试
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+# ---------------------------------------------------------------------------
 # 响应
 # ---------------------------------------------------------------------------
 class PlayerCredential(BaseModel):
@@ -230,6 +249,8 @@ class PublicGameState(BaseModel):
     winners: list[str]
     # 积分赛概要；普通比赛为 None
     stakes: StakesSummary | None = None
+    # 练习赛概要；非练习赛对局为 None
+    practice: "PracticeSummary | None" = None
 
 
 class MyPlayerState(BaseModel):
@@ -527,3 +548,164 @@ class CupState(BaseModel):
     invalidations: list[CupInvalidation]
     # 请求历史（按 request_id 幂等）
     request_log: list[dict]
+
+
+# ---------------------------------------------------------------------------
+# 练习赛大厅：响应
+# ---------------------------------------------------------------------------
+class PracticeRoomSummary(BaseModel):
+    room_id: str
+    name: str
+    width: int
+    height: int
+    blocked: list[list[int]]
+    finish: list[list[int]]
+    turn_duration_seconds: int
+    confirm_timeout_seconds: int
+    # 各状态报名数与进行中练习赛场数
+    queued: int
+    paused: int
+    invited: int
+    active_games: int
+    created_at: str
+
+
+class PracticeQueueEntry(BaseModel):
+    account_id: str
+    name: str
+    seq: int
+    status: str  # queued | paused | invited
+    since: str
+
+
+class PracticeGamePlayer(BaseModel):
+    account_id: str
+    name: str
+    player_id: str
+
+
+class PracticeGameView(BaseModel):
+    game_id: str
+    room_id: str
+    room_name: str
+    invitation_id: str
+    status: str  # active | finished | ended
+    players: list[PracticeGamePlayer]
+    # 仅按账号视角查询时给出本人席位
+    my_player_id: str | None = None
+    created_at: str
+    ended_at: str | None
+
+
+class PracticeRoomView(PracticeRoomSummary):
+    # 进行中的报名队列（queued/paused/invited），按入队顺序
+    queue: list[PracticeQueueEntry]
+    # 本房配出的全部练习对局
+    games: list[PracticeGameView]
+
+
+class PracticeRegistrationResult(BaseModel):
+    room_id: str
+    account_id: str
+    status: str
+    epoch: int
+    seq: int
+    request_id: str
+    # 按请求标识重试时为 true，不消耗新的排队名额
+    idempotent_replay: bool
+
+
+class PracticeInvitationSeat(BaseModel):
+    account_id: str
+    name: str
+    response: str  # pending | confirmed | declined
+    responded_at: str | None
+    # 开局后该席位的玩家 ID（未开局为 None）
+    player_id: str | None
+
+
+class PracticeInvitationView(BaseModel):
+    invitation_id: str
+    room_id: str
+    room_name: str
+    status: str  # pending | started | declined | expired
+    deadline: str
+    game_id: str | None
+    seats: list[PracticeInvitationSeat]
+    # 按账号视角查询时给出本人应答
+    my_response: str | None = None
+    created_at: str
+
+
+class PracticePairResult(BaseModel):
+    room_id: str
+    paired: bool
+    invitation_id: str | None
+    invitation: PracticeInvitationView | None
+    request_id: str
+    idempotent_replay: bool
+
+
+class PracticeConfirmResult(BaseModel):
+    invitation_id: str
+    room_id: str
+    status: str
+    my_response: str
+    all_confirmed: bool
+    # 第二人确认时开出对局：started=true 并给出 game_id
+    started: bool
+    game_id: str | None
+    idempotent_replay: bool
+    invitation: PracticeInvitationView
+
+
+class PracticeDeclineResult(BaseModel):
+    invitation_id: str
+    room_id: str
+    status: str
+    my_response: str
+    idempotent_replay: bool
+    invitation: PracticeInvitationView
+
+
+class PracticeMyRegistration(BaseModel):
+    room_id: str
+    room_name: str
+    status: str
+    epoch: int
+    seq: int
+    # 在可配对队列中的位置（1 起）；非 queued 状态为 None
+    position: int | None
+    request_id: str
+    created_at: str
+    updated_at: str
+
+
+class PracticeMeView(BaseModel):
+    account_id: str
+    name: str
+    # 本人在各房间的报名（含已终结的历史状态）
+    registrations: list[PracticeMyRegistration]
+    # 本人待处理的配对邀请
+    invitations: list[PracticeInvitationView]
+    # 本人已配成的练习对局
+    games: list[PracticeGameView]
+
+
+class PracticeEndResult(BaseModel):
+    game_id: str
+    room_id: str
+    status: str
+    ended_at: str
+    # 随结束放回大厅排队的账号
+    released_accounts: list[str]
+
+
+class PracticeSummary(BaseModel):
+    room_id: str
+    invitation_id: str
+    status: str
+
+
+# PracticeSummary 定义在文件后部，显式重建以解析前向引用
+PublicGameState.model_rebuild()

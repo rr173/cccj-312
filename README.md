@@ -86,6 +86,37 @@ Python 3.11 + FastAPI + SQLite（WAL 模式）实现的回合制网格竞速游�
   对局由有效对局重新推导，保持一致。
 - **计分**：不报名、不扣分、不发积分奖；账号余额与流水不受杯赛影响。
 
+## 2.3 练习赛大厅
+
+让不认识的选手无须裁定员凑名单也能开局。裁定员只负责开房与（可选）提前结束，
+配对与确认全部由选手凭本人账号完成。**不报名、不扣积分、不动签表**，
+普通比赛、积分赛和杯赛不参与大厅占用。
+
+- **练习房**：裁定员开设练习房，指定地图、回合时长与**配对确认时限**
+  （``confirm_timeout_seconds``）。地图需至少 2 个左边界起点格与 2 个终点格
+  （两名选手都须完赛）。
+- **排队**：选手凭现有账号（``X-Account-Secret``）在任意多个房间排队；
+  同一房间同一账号至多一条进行中的报名，可随时撤掉尚未收到邀请的报名；
+  撤销/被退队/被用掉后可重新报名（排到队尾）。报名/撤销按 ``request_id`` 幂等，
+  重试旧请求不消耗新的排队名额。
+- **配对**：任何客户端可请求某房间配对一次：从该房当前可配对的报名中按入队
+  顺序取最早的两位发出邀请，不足两位则不发邀请。同一账号同一时刻至多持有
+  一份待确认邀请或一场未结束的练习赛；收到邀请后，选手在其他房间的报名
+  **暂停配对但保留原排队顺序**，配对时跳过暂停的报名。配对按
+  ``(room_id, request_id)`` 幂等，重试不会多发邀请。
+- **确认**：两位选手都须在时限内凭本人账号确认同一份邀请；第二人确认时
+  直接开出一局可玩的比赛（席位密钥即账号密钥，凭既有 takeover 接口接手）。
+  有人拒绝则解除邀请，**只将拒绝者从该房退队**；到期未配成则**只将未确认者
+  从该房退队**；其余报名恢复原顺序，无须重新排队。
+- **过期**：以服务端时间判定邀请是否到期；过期邀请由后续操作懒处理
+  （无后台定时任务），不能挡住后续配对，也不能被迟到的确认复活。
+- **对局**：成功开局时双方在本房的报名用掉，其他房的报名继续暂停，直到
+  本局全员完赛或裁定员提前结束。提前结束不算完赛，保留已公开公告，
+  不再接手、提交或裁定新回合（``409 practice_ended``）。
+- **一致性**：配对/确认/撤销/结束都在 ``BEGIN IMMEDIATE`` 事务中完成，
+  并发时不会多发有效邀请、多开局或提前放回选手；全部状态持久化在 SQLite，
+  服务重启后仍可查询并接续办理。
+
 ## 3. 启动
 
 ```bash
@@ -116,6 +147,10 @@ uvicorn race_server.main:app --host 0.0.0.0 --port 8000
 | GET  | `/referee/cups` | 列出杯赛 |
 | POST | `/referee/cups/{cup_id}/matches/{match_no}/start` | 开赛某场次：`{"request_id": "...", "expected_revision": n}`（后两项可选版本保护） |
 | POST | `/referee/cups/{cup_id}/games/{game_id}/rematch` | 裁定某已完赛对局重赛：`{"request_id": "..."}` |
+| POST | `/referee/practice-rooms` | 开设练习房：地图参数 + `{"confirm_timeout_seconds": 秒}` |
+| GET  | `/referee/practice-rooms` | 列出练习房（含各状态报名数） |
+| POST | `/referee/practice-rooms/{room_id}/pair` | 请求该房配对一次 `{"request_id": "..."}`：取当前可配对的最早两位 |
+| POST | `/referee/practice-games/{game_id}/end` | 提前结束练习赛：不算完赛，保留公告，双方其他房报名恢复 |
 
 ### 选手账号（请求头 `X-Account-Secret`）
 
@@ -124,6 +159,16 @@ uvicorn race_server.main:app --host 0.0.0.0 --port 8000
 | GET  | `/accounts/me` | 本人可用积分、各场占用（holds）与全部收支流水（ledger） |
 | POST | `/games/{game_id}/stakes/enroll` | 报名 `{"request_id": "..."}`，占用报名费；按请求标识幂等 |
 | POST | `/games/{game_id}/stakes/withdraw` | 发车前撤回 `{"request_id": "..."}`，立即恢复可用积分；按请求标识幂等 |
+| POST | `/practice-rooms/{room_id}/register` | 在该房排队 `{"request_id": "..."}`；被占用时入队但暂停配对 |
+| POST | `/practice-rooms/{room_id}/withdraw` | 撤掉尚未收到邀请的报名 `{"request_id": "..."}`；按请求标识幂等 |
+| POST | `/practice-rooms/{room_id}/pair` | 请求该房配对一次 `{"request_id": "..."}`（与裁定员接口同一幂等空间） |
+| POST | `/practice-invitations/{invitation_id}/confirm` | 凭本人账号确认邀请；第二人确认时直接开局 |
+| POST | `/practice-invitations/{invitation_id}/decline` | 拒绝邀请：解除邀请，仅本人从该房退队 |
+| GET  | `/practice-invitations/{invitation_id}` | 查看本人邀请当前状态（含过期懒处理） |
+| GET  | `/practice/me` | 本人大厅总览：各房排队状态、待回复邀请、已配成对局 |
+| GET  | `/practice/me/registrations` | 本人在各房间的排队状态（含历史与队列位置） |
+| GET  | `/practice/me/invitations` | 本人待回复的配对邀请 |
+| GET  | `/practice/me/games` | 本人已配成的练习对局（含本人席位 player_id） |
 
 ### 玩家设备
 
@@ -146,6 +191,9 @@ uvicorn race_server.main:app --host 0.0.0.0 --port 8000
 | GET | `/cups/{cup_id}/champion` | 当前冠军（含是否曾被撤回） |
 | GET | `/cups/{cup_id}/invalidations` | 失效记录（失效对局、原因、连带失效、冠军撤回） |
 | GET | `/cups/games/{game_id}` | 对局所属杯赛场次（关联对局）；非杯赛对局返回 `404 not_cup_game` |
+| GET | `/practice-rooms` | 练习房列表（地图、回合时长、确认时限、各状态报名数） |
+| GET | `/practice-rooms/{room_id}` | 练习房详情：当前队列（按入队顺序）与本房配出的对局 |
+| GET | `/practice-games/{game_id}` | 对局所属练习房与配对邀请；非练习赛对局返回 `404 practice_not_found` |
 | GET | `/health` | 健康检查 |
 
 错误响应统一为 `{"error": "...", "detail": "..."}`。
@@ -232,7 +280,44 @@ curl -s -X POST localhost:8000/referee/cups/$CID/games/$GAME/rematch \
 # 之后重新开赛场次（必须是新对局）：curl .../cups/$CID/matches/1/start
 ```
 
-## 8. 测试
+## 8. 练习赛大厅典型流程
+
+```bash
+TOK=change-me
+# 裁定员开房：5x3 地图、两个终点格、回合 60 秒、配对确认时限 30 秒
+R=$(curl -s -X POST localhost:8000/referee/practice-rooms -H "X-Referee-Token: $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"lobby","width":5,"height":3,"finish":[[4,0],[4,1]],
+       "turn_duration_seconds":60,"confirm_timeout_seconds":30}')
+RID=$(python3 -c "import json,sys;print(json.load(sys.stdin)['room_id'])" <<<"$R")
+
+# 选手凭本人账号在房间排队（可在多个房间各排一份）
+curl -s -X POST localhost:8000/practice-rooms/$RID/register \
+  -H "X-Account-Secret: $ASEC" -H 'Content-Type: application/json' -d '{"request_id":"reg-a-1"}'
+curl -s -X POST localhost:8000/practice-rooms/$RID/register \
+  -H "X-Account-Secret: $BSEC" -H 'Content-Type: application/json' -d '{"request_id":"reg-b-1"}'
+
+# 任意客户端请求配对一次：取当前可配对的最早两位
+P=$(curl -s -X POST localhost:8000/practice-rooms/$RID/pair \
+  -H "X-Account-Secret: $ASEC" -H 'Content-Type: application/json' -d '{"request_id":"pair-1"}')
+IID=$(python3 -c "import json,sys;print(json.load(sys.stdin)['invitation_id'])" <<<"$P")
+
+# 双方凭本人账号确认；第二人确认时直接开局
+curl -s -X POST localhost:8000/practice-invitations/$IID/confirm -H "X-Account-Secret: $ASEC"
+G=$(curl -s -X POST localhost:8000/practice-invitations/$IID/confirm -H "X-Account-Secret: $BSEC")
+GID=$(python3 -c "import json,sys;print(json.load(sys.stdin)['game_id'])" <<<"$G")
+
+# 查看自己的排队状态、待回复邀请与已配成对局
+curl -s localhost:8000/practice/me -H "X-Account-Secret: $ASEC"
+# 凭本人账号接手席位，之后与普通比赛完全一致（提交指令、裁定员关回合）
+PID=$(python3 -c "import json;print(json.loads('''$G''')['invitation']['seats'][0]['player_id'])")
+curl -s -X POST localhost:8000/games/$GID/players/$PID/takeover -H "X-Takeover-Secret: $ASEC"
+
+# 裁定员提前结束练习：不算完赛，保留公告，双方其他房报名恢复
+curl -s -X POST localhost:8000/referee/practice-games/$GID/end -H "X-Referee-Token: $TOK"
+```
+
+## 9. 测试
 
 ```bash
 python3 -m pytest tests/ -q
@@ -247,4 +332,9 @@ python3 -m pytest tests/ -q
 - `tests/test_cup.py`：杯赛签表公布、开赛资格、接手、先后到达/同回合签位裁定、
   双败晋级、总决赛与加赛、重赛失效传播与冠军撤回、幂等/迟到请求、重启持久性；
 - `tests/test_cup_concurrency.py`：并发开赛只产生一局有效、并发重赛只生效一次、
-  最后一回合裁定与重赛并发不产生两局同时有效。
+  最后一回合裁定与重赛并发不产生两局同时有效；
+- `tests/test_practice.py`：练习房开设与校验、排队/撤销/重排、配对顺序与跳过暂停、
+  确认开局、拒绝与过期退队、提前结束、与其他玩法互不干扰、重启持久性；
+- `tests/test_practice_concurrency.py`：并发配对不多发邀请、并发确认只开一局、
+  确认与拒绝并发只有一个结果、结束与最终裁定并发只有一个终局、
+  同标识并发报名只占一个名额、过期邀请不被迟到的确认复活。

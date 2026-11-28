@@ -81,6 +81,13 @@ def _get_cup_game(conn: sqlite3.Connection, game_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _get_practice_game(conn: sqlite3.Connection, game_id: str) -> sqlite3.Row | None:
+    """练习赛对局扩展信息；非练习赛对局返回 None。"""
+    return conn.execute(
+        "SELECT * FROM practice_games WHERE game_id=?", (game_id,)
+    ).fetchone()
+
+
 def _validate_map(
     width: int, height: int, blocked: list[list[int]], finish: list[list[int]]
 ) -> None:
@@ -348,6 +355,10 @@ def _effective_status(conn: sqlite3.Connection, game: sqlite3.Row) -> str:
     stakes = _get_stakes(conn, game["game_id"])
     if stakes is not None and stakes["status"] == "cancelled":
         return "cancelled"
+    practice = _get_practice_game(conn, game["game_id"])
+    if practice is not None and practice["status"] == "ended":
+        # 提前结束的练习赛不算完赛，对外呈现 ended
+        return "ended"
     return game["status"]
 
 
@@ -470,6 +481,7 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
         game = _get_game(conn, game_id)
         stakes = _get_stakes(conn, game_id)
         cup_game = _get_cup_game(conn, game_id)
+        practice = _get_practice_game(conn, game_id)
         if stakes is not None and stakes["status"] == "cancelled":
             # 取消与最终裁定并发时，写锁保证只有一个终局生效
             raise ServiceError(409, "stakes_cancelled", "该积分赛已取消，不再裁定新结果")
@@ -477,6 +489,11 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
             # 失效对局保留已公开公告，但不再接受裁定
             raise ServiceError(
                 409, "cup_game_invalidated", "该对局已因重赛失效，不能继续裁定"
+            )
+        if practice is not None and practice["status"] == "ended":
+            # 提前结束的练习赛：保留已公开公告，不再裁定新回合
+            raise ServiceError(
+                409, "practice_ended", "该练习赛已被裁定员提前结束，不再裁定新回合"
             )
         if game["status"] != "active":
             if game["status"] == "finished":
@@ -607,6 +624,22 @@ def close_turn(game_id: str, expected_turn_no: int | None = None) -> dict[str, A
                 "UPDATE games SET status='finished', updated_at=? WHERE game_id=?",
                 (now, game_id),
             )
+            if practice is not None:
+                # 练习赛全员完赛：双方在大厅其他房间的暂停报名恢复原顺序
+                conn.execute(
+                    "UPDATE practice_games SET status='finished', updated_at=? "
+                    "WHERE game_id=?",
+                    (now, game_id),
+                )
+                for account_id in (
+                    practice["home_account_id"],
+                    practice["away_account_id"],
+                ):
+                    conn.execute(
+                        "UPDATE practice_registrations SET status='queued', "
+                        "updated_at=? WHERE account_id=? AND status='paused'",
+                        (now, account_id),
+                    )
             if cup_game is not None:
                 # 杯赛对局：先到终点者胜；同回合到达时原始签位靠前者胜
                 finishers = conn.execute(
@@ -670,6 +703,11 @@ def takeover(game_id: str, player_id: str, secret: str) -> dict[str, Any]:
         if cup_game is not None and not cup_game["valid"]:
             raise ServiceError(
                 409, "cup_game_invalidated", "该对局已因重赛失效，不能再接手"
+            )
+        practice = _get_practice_game(conn, game_id)
+        if practice is not None and practice["status"] == "ended":
+            raise ServiceError(
+                409, "practice_ended", "该练习赛已被裁定员提前结束，不能再接手"
             )
         if not verify_secret(pepper, secret, player["secret_hash"]):
             raise ServiceError(401, "bad_secret", "接手密钥错误")
@@ -808,6 +846,11 @@ def submit_command(game_id: str, token: str, direction: str) -> dict[str, Any]:
             raise ServiceError(
                 409, "cup_game_invalidated", "该对局已因重赛失效，不能提交指令"
             )
+        practice = _get_practice_game(conn, game_id)
+        if practice is not None and practice["status"] == "ended":
+            raise ServiceError(
+                409, "practice_ended", "该练习赛已被裁定员提前结束，不能提交指令"
+            )
         if game["status"] != "active":
             raise ServiceError(409, "game_not_active", "游戏未在进行中，不能提交指令")
         turn = _get_current_turn(conn, game)
@@ -911,6 +954,14 @@ def get_public_state(game_id: str) -> dict[str, Any]:
                 "roster_size": roster_size,
                 "pot": stakes["entry_fee"] * enrolled,
             }
+        practice_summary = None
+        practice = _get_practice_game(conn, game_id)
+        if practice is not None:
+            practice_summary = {
+                "room_id": practice["room_id"],
+                "invitation_id": practice["invitation_id"],
+                "status": practice["status"],
+            }
         return {
             "game_id": game_id,
             "name": game["name"],
@@ -935,6 +986,7 @@ def get_public_state(game_id: str) -> dict[str, Any]:
             "players": [_player_public(p) for p in players],
             "winners": [r["player_id"] for r in winners_rows],
             "stakes": stakes_summary,
+            "practice": practice_summary,
         }
     finally:
         conn.close()
